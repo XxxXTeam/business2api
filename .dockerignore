@@ -4,13 +4,9 @@
 
 # Data
 data/
-*.json
-!config.json.example
 
-# Node (not needed for Go build)
+# Node modules (will be installed in Docker)
 node_modules/
-main.js
-package.json
 package-lock.json
 
 # IDE
