@@ -258,6 +258,258 @@ func debugScreenshot(page *rod.Page, threadID int, step string) {
 	log.Printf("[注册 %d] 📸 截图保存: %s", threadID, filename)
 }
 
+// handleAdditionalSteps 处理额外步骤（复选框、密码、公司信息等）
+func handleAdditionalSteps(page *rod.Page, threadID int) bool {
+	log.Printf("[注册 %d] 检查是否需要处理额外步骤...", threadID)
+	
+	hasAdditionalSteps := false
+	
+	// 检查是否需要同意条款
+	checkboxResult, _ := page.Eval(`() => {
+		const checkboxes = document.querySelectorAll('input[type="checkbox"]');
+		for (const checkbox of checkboxes) {
+			if (!checkbox.checked) {
+				checkbox.click();
+				return { clicked: true };
+			}
+		}
+		return { clicked: false };
+	}`)
+	
+	if checkboxResult != nil && checkboxResult.Value.Get("clicked").Bool() {
+		hasAdditionalSteps = true
+		log.Printf("[注册 %d] 已勾选条款复选框", threadID)
+		time.Sleep(1 * time.Second)
+	}
+	
+	// 检查是否需要输入密码
+	passwordResult, _ := page.Eval(`() => {
+		const passwordFields = document.querySelectorAll('input[type="password"]');
+		if (passwordFields.length > 0) {
+			for (const field of passwordFields) {
+				if (!field.value) {
+					field.value = 'TestPassword123!';
+					// 触发事件
+					field.dispatchEvent(new Event('input', { bubbles: true }));
+					field.dispatchEvent(new Event('change', { bubbles: true }));
+					return { set: true };
+				}
+			}
+		}
+		return { set: false };
+	}`)
+	
+	if passwordResult != nil && passwordResult.Value.Get("set").Bool() {
+		hasAdditionalSteps = true
+		log.Printf("[注册 %d] 已填写密码", threadID)
+		time.Sleep(1 * time.Second)
+	}
+	
+	// 检查是否需要公司信息
+	companyResult, _ := page.Eval(`() => {
+		const companySelectors = [
+			'input[name*="company"]',
+			'input[name*="organization"]',
+			'input[name*="business"]',
+			'input[placeholder*="Company"]',
+			'input[placeholder*="Organization"]'
+		];
+		
+		for (const selector of companySelectors) {
+			const elements = document.querySelectorAll(selector);
+			if (elements.length > 0 && !elements[0].value) {
+				elements[0].value = 'Test Company';
+				elements[0].dispatchEvent(new Event('input', { bubbles: true }));
+				return { set: true };
+			}
+		}
+		
+		return { set: false };
+	}`)
+	
+	if companyResult != nil && companyResult.Value.Get("set").Bool() {
+		hasAdditionalSteps = true
+		log.Printf("[注册 %d] 已填写公司名称", threadID)
+		time.Sleep(1 * time.Second)
+	}
+	
+	// 检查是否需要职位信息
+	roleResult, _ := page.Eval(`() => {
+		const roleFields = [
+			'input[name*="title"]',
+			'input[name*="role"]',
+			'input[name*="position"]',
+			'input[placeholder*="Title"]',
+			'input[placeholder*="Role"]'
+		];
+		
+		for (const selector of roleFields) {
+			const elements = document.querySelectorAll(selector);
+			if (elements.length > 0 && !elements[0].value) {
+				elements[0].value = 'Developer';
+				elements[0].dispatchEvent(new Event('input', { bubbles: true }));
+				return { set: true };
+			}
+		}
+		
+		return { set: false };
+	}`)
+	
+	if roleResult != nil && roleResult.Value.Get("set").Bool() {
+		hasAdditionalSteps = true
+		log.Printf("[注册 %d] 已填写职位", threadID)
+		time.Sleep(1 * time.Second)
+	}
+	
+	// 如果有额外步骤，尝试提交
+	if hasAdditionalSteps {
+		log.Printf("[注册 %d] 发现有额外步骤，尝试提交...", threadID)
+		
+		// 尝试提交额外信息
+		for i := 0; i < 3; i++ {
+			submitResult, _ := page.Eval(`() => {
+				const submitButtons = [
+					...document.querySelectorAll('button'),
+					...document.querySelectorAll('input[type="submit"]')
+				];
+				
+				for (const button of submitButtons) {
+					if (!button.disabled && button.offsetParent !== null) {
+						const text = button.textContent || '';
+						if (text.includes('同意') || text.includes('Confirm') || 
+							text.includes('继续') || text.includes('Next') || 
+							text.includes('Submit') || text.includes('完成')) {
+							button.click();
+							return { clicked: true };
+						}
+					}
+				}
+				
+				// 点击第一个可用的提交按钮
+				for (const button of submitButtons) {
+					if (!button.disabled && button.offsetParent !== null) {
+						button.click();
+						return { clicked: true };
+					}
+				}
+				
+				return { clicked: false };
+			}`)
+			
+			if submitResult != nil && submitResult.Value.Get("clicked").Bool() {
+				log.Printf("[注册 %d] 已提交额外信息", threadID)
+				break
+			}
+			
+			time.Sleep(1 * time.Second)
+		}
+		
+		// 等待可能的跳转
+		time.Sleep(3 * time.Second)
+		return true
+	}
+	
+	return false
+}
+
+// checkAndHandleAdminPage 检查并处理管理创建页面
+func checkAndHandleAdminPage(page *rod.Page, threadID int) bool {
+	currentURL := ""
+	info, _ := page.Info()
+	if info != nil {
+		currentURL = info.URL
+	}
+	
+	// 检查是否是管理创建页面
+	if strings.Contains(currentURL, "/admin/create") {
+		log.Printf("[注册 %d] 检测到管理创建页面，尝试完成设置...", threadID)
+		
+		// 尝试填写必要的表单字段
+		formCompleted, _ := page.Eval(`() => {
+			let completed = false;
+			
+			// 查找公司名称字段
+			const companyFields = [
+				'input[name*="company"]',
+				'input[name*="organization"]',
+				'input[name*="business"]',
+				'input[placeholder*="Company"]',
+				'input[placeholder*="Organization"]'
+			];
+			
+			for (const selector of companyFields) {
+				const elements = document.querySelectorAll(selector);
+				if (elements.length > 0) {
+					elements[0].value = 'Test Company';
+					elements[0].dispatchEvent(new Event('input', { bubbles: true }));
+					completed = true;
+					console.log('填写公司名称');
+					break;
+				}
+			}
+			
+			// 查找职位字段
+			const roleFields = [
+				'input[name*="title"]',
+				'input[name*="role"]',
+				'input[name*="position"]',
+				'input[placeholder*="Title"]',
+				'input[placeholder*="Role"]'
+			];
+			
+			for (const selector of roleFields) {
+				const elements = document.querySelectorAll(selector);
+				if (elements.length > 0) {
+					elements[0].value = 'Developer';
+					elements[0].dispatchEvent(new Event('input', { bubbles: true }));
+					completed = true;
+					console.log('填写职位');
+					break;
+				}
+			}
+			
+			// 查找并点击继续按钮
+			const continueTexts = ['Continue', '继续', 'Next', 'Submit', 'Finish', '完成'];
+			const allButtons = document.querySelectorAll('button');
+			
+			for (const button of allButtons) {
+				if (button.offsetParent !== null && !button.disabled) {
+					const text = (button.textContent || '').trim();
+					if (continueTexts.some(t => text.includes(t))) {
+						button.click();
+						console.log('点击继续按钮:', text);
+						completed = true;
+						return completed;
+					}
+				}
+			}
+			
+			// 如果没有找到特定按钮，尝试点击第一个可见按钮
+			for (const button of allButtons) {
+				if (button.offsetParent !== null && !button.disabled) {
+					const text = button.textContent || '';
+					if (text.trim() && !text.includes('Cancel') && !text.includes('取消')) {
+						button.click();
+						console.log('点击通用按钮:', text);
+						completed = true;
+						break;
+					}
+				}
+			}
+			
+			return completed;
+		}`)
+		
+		if formCompleted != nil && formCompleted.Value.Bool() {
+			log.Printf("[注册 %d] 已填写管理表单，等待跳转...", threadID)
+			time.Sleep(5 * time.Second)
+			return true
+		}
+	}
+	
+	return false
+}
+
 func RunBrowserRegister(headless bool, proxy string, threadID int) (result *BrowserRegisterResult) {
 	result = &BrowserRegisterResult{}
 	defer func() {
@@ -626,7 +878,10 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 			inputs[0].blur();
 		}
 	}`)
-	time.Sleep(200 * time.Millisecond) // 优化等待时间
+	time.Sleep(200 * time.Millisecond)
+	
+	// 确认提交姓名
+	confirmSubmitted := false
 	for i := 0; i < 5; i++ {
 		clickResult, _ := page.Eval(`() => {
 			const targets = ['同意', 'Confirm', '继续', 'Next', 'Continue', 'I agree'];
@@ -660,10 +915,32 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		}`)
 
 		if clickResult != nil && clickResult.Value.Get("clicked").Bool() {
+			confirmSubmitted = true
 			break
 		}
 		time.Sleep(1000 * time.Millisecond)
 	}
+	
+	if !confirmSubmitted {
+		log.Printf("[注册 %d] ⚠️ 未能点击确认按钮，尝试继续", threadID)
+	}
+	
+	time.Sleep(3 * time.Second)
+	
+	// 等待页面稳定
+	page.WaitLoad()
+	time.Sleep(2 * time.Second)
+	
+	// 处理额外步骤（复选框、密码、公司信息等）
+	handleAdditionalSteps(page, threadID)
+	
+	// 检查并处理管理创建页面
+	checkAndHandleAdminPage(page, threadID)
+	
+	// 等待更多可能的跳转
+	time.Sleep(3 * time.Second)
+	
+	// 尝试多次点击可能出现的额外按钮
 	for i := 0; i < 15; i++ {
 		time.Sleep(2 * time.Second)
 
@@ -700,6 +977,51 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 
 		if authorization != "" {
 			break
+		}
+	}
+	
+	// 增强的 Authorization 获取逻辑
+	if authorization == "" {
+		log.Printf("[注册 %d] 仍未获取到 Authorization，尝试更多方法...", threadID)
+		
+		// 尝试刷新页面
+		page.Reload()
+		page.WaitLoad()
+		time.Sleep(3 * time.Second)
+		
+		// 尝试从 localStorage 获取
+		localStorageAuth, _ := page.Eval(`() => {
+			return localStorage.getItem('Authorization') || 
+				   localStorage.getItem('authorization') ||
+				   localStorage.getItem('auth_token') ||
+				   localStorage.getItem('token');
+		}`)
+		
+		if localStorageAuth != nil && localStorageAuth.Value.String() != "" {
+			authorization = localStorageAuth.Value.String()
+			log.Printf("[注册 %d] 从 localStorage 获取 Authorization", threadID)
+		}
+		
+		// 从页面源代码中提取
+		pageContent, _ := page.Eval(`() => document.body ? document.body.innerHTML : ''`)
+		if pageContent != nil && pageContent.Value.String() != "" {
+			content := pageContent.Value.String()
+			re := regexp.MustCompile(`"authorization"\s*:\s*"([^"]+)"`)
+			if matches := re.FindStringSubmatch(content); len(matches) > 1 {
+				authorization = matches[1]
+				log.Printf("[注册 %d] 从页面内容提取 Authorization", threadID)
+			}
+		}
+		
+		// 从当前 URL 中提取
+		info, _ := page.Info()
+		if info != nil {
+			currentURL := info.URL
+			re := regexp.MustCompile(`[?&](?:token|auth)=([^&]+)`)
+			if matches := re.FindStringSubmatch(currentURL); len(matches) > 1 {
+				authorization = matches[1]
+				log.Printf("[注册 %d] 从 URL 提取 Authorization", threadID)
+			}
 		}
 	}
 
