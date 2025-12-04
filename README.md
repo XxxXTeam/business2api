@@ -13,10 +13,10 @@ OpenAI 兼容的 Gemini Business API 代理服务，支持账号池管理和自�
 
 ## 支持的模型
 
-- `gemini-2.5-flash` / `gemini-2.5-flash-image` / `gemini-2.5-flash-video`
-- `gemini-2.5-pro` / `gemini-2.5-pro-image` / `gemini-2.5-pro-video`
-- `gemini-3-pro-preview` / `gemini-3-pro-preview-image` / `gemini-3-pro-preview-video`
-- `gemini-3-pro` / `gemini-3-pro-image` / `gemini-3-pro-video`
+- `gemini-2.5-flash` / `gemini-2.5-flash-image` / `gemini-2.5-flash-video`  /  `gemini-2.5-flash-search` 
+- `gemini-2.5-pro` / `gemini-2.5-pro-image` / `gemini-2.5-pro-video`  /  `gemini-2.5-pro-search` 
+- `gemini-3-pro-preview` / `gemini-3-pro-preview-image` / `gemini-3-pro-preview-video`  /  `gemini-3-pro-preview-search` 
+- `gemini-3-pro` / `gemini-3-pro-image` / `gemini-3-pro-video` /  `gemini-3-pro-search` 
 
 ---
 
