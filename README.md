@@ -36,8 +36,8 @@
 mkdir business2api && cd business2api
 
 # 下载必要文件
-wget https://raw.githubusercontent.com/XxxXTeam/business2api/main/docker/docker-compose.yml
-wget https://raw.githubusercontent.com/XxxXTeam/business2api/main/config/config.json.example -O config.json
+wget https://raw.githubusercontent.com/XxxXTeam/business2api/master/docker/docker-compose.yml
+wget https://raw.githubusercontent.com/XxxXTeam/business2api/master/config/config.json.example -O config.json
 
 # 编辑配置
 vim config.json
@@ -56,7 +56,7 @@ docker compose up -d
 docker pull ghcr.io/xxxteam/business2api:latest
 
 # 创建配置文件
-wget https://raw.githubusercontent.com/XxxXTeam/business2api/main/config/config.json.example -O config.json
+wget https://raw.githubusercontent.com/XxxXTeam/business2api/master/config/config.json.example -O config.json
 
 # 运行容器
 docker run -d \
