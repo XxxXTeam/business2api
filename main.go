@@ -540,6 +540,11 @@ func initProxyPool() {
 			proxy.Manager.SetProxies([]string{Proxy})
 		}
 	}
+	if proxy.Manager.TotalCount() == 0 || AutoSubscribeEnabled {
+		logger.Info("🔄 启动自动订阅服务（每小时注册获取代理）...")
+		proxy.Manager.StartAutoSubscribe()
+	}
+
 	if proxy.Manager.TotalCount() > 0 {
 		proxy.Manager.StartAutoUpdate()
 		logger.Info("✅ 代理池已初始化: %d 个节点, %d 个健康",
@@ -2649,6 +2654,41 @@ func runBrowserRefreshMode(email string) {
 	}
 }
 
+var AutoSubscribeEnabled bool
+
+func init() {
+	// 设置环境变量禁用 quic-go 的警告
+	os.Setenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING", "true")
+	filterStdout()
+}
+func filterStdout() {
+	// 创建管道
+	r, w, err := os.Pipe()
+	if err != nil {
+		return
+	}
+	origStdout := os.Stdout
+	os.Stdout = w
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Read(buf)
+			if err != nil {
+				break
+			}
+			line := string(buf[:n])
+			// 过滤特定日志
+			if strings.Contains(line, "REALITY localAddr:") ||
+				strings.Contains(line, "DialTLSContext") ||
+				strings.Contains(line, "sys_conn.go") ||
+				strings.Contains(line, "failed to sufficiently increase receive buffer size") {
+				continue // 丢弃
+			}
+			origStdout.Write(buf[:n])
+		}
+	}()
+}
+
 func main() {
 	log.SetFlags(log.Ltime | log.Lshortfile)
 
@@ -2664,6 +2704,8 @@ func main() {
 		case "--once":
 			register.RegisterOnce = true
 			logger.Info("🔧 单次运行模式")
+		case "--auto":
+			AutoSubscribeEnabled = true
 		case "--refresh":
 			refreshMode = true
 			// 检查下一个参数是否是邮箱
@@ -2675,6 +2717,7 @@ func main() {
 
 选项:
   --debug, -d           调试模式，保存注册过程截图
+  --auto                自动订阅模式，每小时注册获取代理
   --refresh [email]     有头浏览器刷新账号（不指定email则使用第一个账号）
   --help, -h            显示帮助`)
 			os.Exit(0)
@@ -2755,19 +2798,34 @@ func runAsClient() {
 		}
 		return Proxy
 	}
-	// 释放代理的函数（通过URL查找并释放实例）
 	pool.ReleaseProxy = func(proxyURL string) {
 		proxy.Manager.ReleaseByURL(proxyURL)
 		logger.Debug("释放代理: %s", proxyURL)
 	}
-
+	pool.GetHealthyCount = func() int {
+		return proxy.Manager.HealthyCount()
+	}
+	go func() {
+		proxy.Manager.CheckAllHealth()
+		if proxy.Manager.HealthyCount() > 0 {
+			poolSize := appConfig.Pool.RegisterThreads
+			if poolSize <= 0 {
+				poolSize = pool.DefaultProxyCount
+			}
+			if poolSize > 10 {
+				poolSize = 10
+			}
+			proxy.Manager.SetMaxPoolSize(poolSize)
+			proxy.Manager.InitInstancePool(poolSize)
+		}
+	}()
 	client := pool.NewPoolClient(appConfig.PoolServer)
 	if err := client.Start(); err != nil {
 		log.Fatalf("❌ 客户端启动失败: %v", err)
 	}
 }
 
-var poolServer *pool.PoolServer // 全局号池服务器实例
+var poolServer *pool.PoolServer
 
 func runAsServer() {
 	logger.Info("🖥️ 启动服务器模式...")
@@ -2780,19 +2838,9 @@ func runAsServer() {
 	if err := pool.Pool.Load(dataDir); err != nil {
 		log.Fatalf("❌ 加载账号失败: %v", err)
 	}
-
-	logger.Info("   监听地址: %s", ListenAddr)
-	logger.Info("   WS 端点: %s/ws", ListenAddr)
-	logger.Info("   账号数量: %d", pool.Pool.TotalCount())
-
-	// 创建号池服务器（WS 将集成到 API 服务中）
 	poolServer = pool.NewPoolServer(pool.Pool, appConfig.PoolServer)
 	poolServer.StartBackground() // 启动后台任务分发和心跳检测
-
-	// 启动号池管理
 	pool.Pool.StartPoolManager()
-
-	// 启动 API 服务（包含 WS 端点）
 	runAPIServer()
 }
 
@@ -2808,7 +2856,6 @@ func runAPIServer() {
 	}
 }
 
-// setupAPIRoutes 设置 API 路由（服务端和本地模式共用）
 func setupAPIRoutes(r *gin.Engine) {
 	// 请求日志中间件
 	r.Use(func(c *gin.Context) {

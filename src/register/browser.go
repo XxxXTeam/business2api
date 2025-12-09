@@ -832,10 +832,11 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		return result
 	}
 
-	// 确保浏览器进程被清理（即使连接失败）
+	// 确保浏览器进程和临时目录被清理（即使连接失败）
 	defer func() {
 		if l != nil {
 			l.Kill()
+			l.Cleanup() // 等待浏览器退出并清理临时用户数据目录
 		}
 	}()
 
@@ -1846,10 +1847,11 @@ func RefreshCookieWithBrowser(acc *pool.Account, headless bool, proxy string) *B
 		return result
 	}
 
-	// 确保浏览器进程被清理（即使连接失败）
+	// 确保浏览器进程和临时目录被清理（即使连接失败）
 	defer func() {
 		if l != nil {
 			l.Kill()
+			l.Cleanup() // 等待浏览器退出并清理临时用户数据目录
 		}
 	}()
 

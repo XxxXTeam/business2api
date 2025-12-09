@@ -38,6 +38,7 @@ var (
 	DefaultProxyCount  = 3                              // 客户端模式默认启动的代理实例数
 	IsProxyReady       func() bool                      // 检查代理是否就绪
 	WaitProxyReady     func(timeout time.Duration) bool // 等待代理就绪
+	GetHealthyCount    func() int                       // 获取健康代理数量
 	proxyReadyTimeout  = 60 * time.Second               // 代理就绪超时时间
 )
 
@@ -263,9 +264,8 @@ func (pc *PoolClient) handleRegisterTask(data map[string]interface{}) {
 	}
 
 	logger.Info("收到注册任务: %d 个账号", count)
-
-	// 等待代理就绪
-	if WaitProxyReady != nil {
+	if GetHealthyCount != nil && GetHealthyCount() >= 1 {
+	} else if WaitProxyReady != nil {
 		if !WaitProxyReady(proxyReadyTimeout) {
 			logger.Warn("代理未就绪，使用静态代理: %s", ClientProxy)
 		}
@@ -315,8 +315,10 @@ func (pc *PoolClient) handleRefreshTask(data map[string]interface{}) {
 
 	logger.Info("收到续期任务: %s", email)
 
-	// 等待代理就绪
-	if WaitProxyReady != nil {
+	// 检查代理：如果已有健康代理则不等待
+	if GetHealthyCount != nil && GetHealthyCount() >= 1 {
+		// 已有健康代理，直接开始
+	} else if WaitProxyReady != nil {
 		if !WaitProxyReady(proxyReadyTimeout) {
 			logger.Warn("代理未就绪，使用静态代理: %s", Proxy)
 		}

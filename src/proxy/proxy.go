@@ -1,13 +1,17 @@
 package proxy
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -28,24 +32,34 @@ var tlsConfig = &tls.Config{InsecureSkipVerify: true}
 // ProxyNode 代理节点
 type ProxyNode struct {
 	Raw       string // 原始链接
-	Protocol  string // vmess, vless, ss, trojan, http, socks5, hysteria2
+	Protocol  string // vmess, vless, ss, trojan, http, socks5, hysteria2, anytls
 	Name      string
 	Server    string
 	Port      int
 	UUID      string // vmess/vless
 	AlterId   int    // vmess
-	Security  string // vmess 加密方式
-	Network   string // tcp, ws, grpc, kcp, quic
-	Path      string // ws path
-	Host      string // ws host
+	Security  string // vmess 加密方式 / vless: none,tls,reality
+	Network   string // tcp, ws, grpc, kcp, quic, httpupgrade, splithttp, xhttp
+	Path      string // ws/http path
+	Host      string // ws/http host
 	TLS       bool
 	SNI       string
-	Password  string // ss/trojan password
+	Password  string // ss/trojan/anytls password
 	Method    string // ss method
 	Type      string // kcp/quic header type (none, srtp, utp, wechat-video, dtls, wireguard)
 	Healthy   bool
 	LastCheck time.Time
 	LocalPort int
+
+	// Reality 相关
+	Flow        string // xtls-rprx-vision
+	Fingerprint string // chrome, firefox, safari, ios, android, edge, 360, qq, random
+	PublicKey   string // reality pbk
+	ShortId     string // reality sid
+	SpiderX     string // reality spx
+
+	// ALPN
+	ALPN string // h2, http/1.1
 }
 
 // InstanceStatus 实例状态
@@ -114,41 +128,23 @@ func (pm *ProxyManager) IsReady() bool {
 	defer pm.mu.RUnlock()
 	return pm.ready
 }
-
-// WaitReady 等待代理池就绪
 func (pm *ProxyManager) WaitReady(timeout time.Duration) bool {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
+	deadline := time.Now().Add(timeout)
 
-	if pm.ready {
-		return true
-	}
+	for time.Now().Before(deadline) {
+		pm.mu.RLock()
+		ready := pm.ready
+		healthyCount := len(pm.healthyNodes)
+		pm.mu.RUnlock()
 
-	// 如果没有代理节点，直接返回
-	if len(pm.nodes) == 0 && !pm.healthChecking {
-		return false
-	}
-
-	// 使用超时等待
-	done := make(chan bool, 1)
-	go func() {
-		pm.mu.Lock()
-		for !pm.ready && pm.healthChecking {
-			pm.readyCond.Wait()
+		if ready || healthyCount > 0 {
+			return true
 		}
-		pm.mu.Unlock()
-		done <- pm.ready
-	}()
-
-	pm.mu.Unlock()
-	select {
-	case result := <-done:
-		pm.mu.Lock()
-		return result
-	case <-time.After(timeout):
-		pm.mu.Lock()
-		return pm.ready
+		time.Sleep(100 * time.Millisecond)
 	}
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return pm.ready || len(pm.healthyNodes) > 0
 }
 
 // SetReady 设置就绪状态
@@ -255,7 +251,50 @@ func (pm *ProxyManager) LoadAll() error {
 	return nil
 }
 
-// loadFromURL 从URL加载
+type SubscriptionInfo struct {
+	Upload   int64
+	Download int64
+	Total    int64
+	Expire   int64
+}
+
+// parseSubscriptionUserinfo 解析 subscription-userinfo 头
+func parseSubscriptionUserinfo(header string) *SubscriptionInfo {
+	if header == "" {
+		return nil
+	}
+	info := &SubscriptionInfo{}
+	parts := strings.Split(header, ";")
+	for _, part := range parts {
+		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(kv[0])
+		value, _ := strconv.ParseInt(strings.TrimSpace(kv[1]), 10, 64)
+		switch key {
+		case "upload":
+			info.Upload = value
+		case "download":
+			info.Download = value
+		case "total":
+			info.Total = value
+		case "expire":
+			info.Expire = value
+		}
+	}
+	return info
+}
+
+// getRemainingTraffic 获取剩余流量（字节）
+func (si *SubscriptionInfo) getRemainingTraffic() int64 {
+	if si == nil || si.Total == 0 {
+		return -1 // 未知
+	}
+	return si.Total - si.Upload - si.Download
+}
+
+// loadFromURL 从URL加载（检查流量信息，过滤0流量订阅）
 func (pm *ProxyManager) loadFromURL(urlStr string) ([]*ProxyNode, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Get(urlStr)
@@ -263,6 +302,27 @@ func (pm *ProxyManager) loadFromURL(urlStr string) ([]*ProxyNode, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	// 检查订阅流量信息
+	userinfo := resp.Header.Get("subscription-userinfo")
+	if userinfo == "" {
+		userinfo = resp.Header.Get("Subscription-Userinfo")
+	}
+	if subInfo := parseSubscriptionUserinfo(userinfo); subInfo != nil {
+		remaining := subInfo.getRemainingTraffic()
+		// usedGB := float64(subInfo.Upload+subInfo.Download) / (1024 * 1024 * 1024)
+		// totalGB := float64(subInfo.Total) / (1024 * 1024 * 1024)
+		// remainGB := float64(remaining) / (1024 * 1024 * 1024)
+
+		// log.Printf("📊 [订阅] 流量信息: 已用 %.2fGB / 总共 %.2fGB, 剩余 %.2fGB", usedGB, totalGB, remainGB)
+
+		// 过滤0流量订阅
+		if remaining == 0 {
+			return nil, fmt.Errorf("订阅流量已耗尽")
+		}
+		if remaining > 0 && remaining < 100*1024*1024 {
+		}
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -305,6 +365,28 @@ func (pm *ProxyManager) parseContent(content string) ([]*ProxyNode, error) {
 	return nodes, nil
 }
 
+// tryBase64Decode 尝试多种 base64 解码方式
+func tryBase64Decode(s string) []byte {
+	s = strings.TrimSpace(s)
+	// 尝试标准 base64
+	if decoded, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return decoded
+	}
+	// 尝试 URL-safe base64
+	if decoded, err := base64.URLEncoding.DecodeString(s); err == nil {
+		return decoded
+	}
+	// 尝试无填充的标准 base64
+	if decoded, err := base64.RawStdEncoding.DecodeString(s); err == nil {
+		return decoded
+	}
+	// 尝试无填充的 URL-safe base64
+	if decoded, err := base64.RawURLEncoding.DecodeString(s); err == nil {
+		return decoded
+	}
+	return nil
+}
+
 // parseLine 解析单行
 func (pm *ProxyManager) parseLine(line string) *ProxyNode {
 	if strings.HasPrefix(line, "vmess://") {
@@ -319,20 +401,54 @@ func (pm *ProxyManager) parseLine(line string) *ProxyNode {
 	if strings.HasPrefix(line, "trojan://") {
 		return parseTrojan(line)
 	}
+	if strings.HasPrefix(line, "hysteria2://") || strings.HasPrefix(line, "hy2://") {
+		return parseHysteria2(line)
+	}
+	if strings.HasPrefix(line, "anytls://") {
+		return parseAnyTLS(line)
+	}
 	if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") || strings.HasPrefix(line, "socks5://") {
 		return parseDirectProxy(line)
 	}
 	return nil
 }
 
+// getStringFromMap 安全获取 map 中的字符串值
+func getStringFromMap(m map[string]interface{}, key string) string {
+	if v, ok := m[key]; ok {
+		switch s := v.(type) {
+		case string:
+			return s
+		case float64:
+			return strconv.FormatFloat(s, 'f', -1, 64)
+		case int:
+			return strconv.Itoa(s)
+		}
+	}
+	return ""
+}
+
+// getIntFromMap 安全获取 map 中的整数值
+func getIntFromMap(m map[string]interface{}, key string) int {
+	if v, ok := m[key]; ok {
+		switch n := v.(type) {
+		case float64:
+			return int(n)
+		case int:
+			return n
+		case string:
+			i, _ := strconv.Atoi(n)
+			return i
+		}
+	}
+	return 0
+}
+
 // parseVmess 解析 vmess 链接
 func parseVmess(link string) *ProxyNode {
 	// vmess://base64(json)
 	data := strings.TrimPrefix(link, "vmess://")
-	decoded, err := base64.StdEncoding.DecodeString(data)
-	if err != nil {
-		decoded, _ = base64.RawStdEncoding.DecodeString(data)
-	}
+	decoded := tryBase64Decode(data)
 	if decoded == nil {
 		return nil
 	}
@@ -347,53 +463,40 @@ func parseVmess(link string) *ProxyNode {
 		Protocol: "vmess",
 	}
 
-	if v, ok := config["ps"].(string); ok {
-		node.Name = v
-	}
-	if v, ok := config["add"].(string); ok {
-		node.Server = v
-	}
-	if v, ok := config["port"]; ok {
-		switch p := v.(type) {
-		case float64:
-			node.Port = int(p)
-		case string:
-			node.Port, _ = strconv.Atoi(p)
-		}
-	}
-	if v, ok := config["id"].(string); ok {
-		node.UUID = v
-	}
-	if v, ok := config["aid"]; ok {
-		switch a := v.(type) {
-		case float64:
-			node.AlterId = int(a)
-		case string:
-			node.AlterId, _ = strconv.Atoi(a)
-		}
-	}
-	if v, ok := config["scy"].(string); ok {
-		node.Security = v
-	} else {
+	node.Name = getStringFromMap(config, "ps")
+	node.Server = getStringFromMap(config, "add")
+	node.Port = getIntFromMap(config, "port")
+	node.UUID = getStringFromMap(config, "id")
+	node.AlterId = getIntFromMap(config, "aid")
+
+	// 加密方式
+	node.Security = getStringFromMap(config, "scy")
+	if node.Security == "" {
 		node.Security = "auto"
 	}
-	if v, ok := config["net"].(string); ok {
-		node.Network = v
-	} else {
+
+	// 传输协议
+	node.Network = getStringFromMap(config, "net")
+	if node.Network == "" {
 		node.Network = "tcp"
 	}
-	if v, ok := config["path"].(string); ok {
-		node.Path = v
-	}
-	if v, ok := config["host"].(string); ok {
-		node.Host = v
-	}
-	if v, ok := config["tls"].(string); ok && v == "tls" {
+
+	// 路径和 Host
+	node.Path = getStringFromMap(config, "path")
+	node.Host = getStringFromMap(config, "host")
+
+	// TLS 设置（支持多种写法）
+	tlsVal := getStringFromMap(config, "tls")
+	if tlsVal != "" && tlsVal != "none" && tlsVal != "0" && tlsVal != "false" {
 		node.TLS = true
 	}
-	if v, ok := config["sni"].(string); ok {
-		node.SNI = v
+	node.SNI = getStringFromMap(config, "sni")
+	if node.SNI == "" && node.TLS {
+		node.SNI = node.Host
 	}
+
+	// Header 类型（kcp/quic）
+	node.Type = getStringFromMap(config, "type")
 
 	if node.Server == "" || node.Port == 0 || node.UUID == "" {
 		return nil
@@ -410,27 +513,92 @@ func parseVless(link string) *ProxyNode {
 	}
 
 	port, _ := strconv.Atoi(u.Port())
+	// URL 解码名称
+	name, _ := url.QueryUnescape(u.Fragment)
+
 	node := &ProxyNode{
 		Raw:      link,
 		Protocol: "vless",
 		UUID:     u.User.Username(),
 		Server:   u.Hostname(),
 		Port:     port,
-		Name:     u.Fragment,
+		Name:     name,
 	}
 
 	query := u.Query()
+
+	// 传输协议（支持更多类型）
 	node.Network = query.Get("type")
 	if node.Network == "" {
 		node.Network = "tcp"
 	}
+
+	// 安全类型
 	node.Security = query.Get("security")
-	if query.Get("security") == "tls" || query.Get("security") == "reality" {
+	if node.Security == "" {
+		node.Security = "none"
+	}
+	if node.Security == "tls" || node.Security == "reality" {
 		node.TLS = true
 	}
-	node.Path = query.Get("path")
+
+	// Flow（XTLS）
+	node.Flow = query.Get("flow")
+
+	// 路径（需要 URL 解码）
+	if path := query.Get("path"); path != "" {
+		node.Path, _ = url.QueryUnescape(path)
+	}
+
+	// Host
 	node.Host = query.Get("host")
+	if node.Host == "" {
+		node.Host = query.Get("sni")
+	}
+
+	// SNI
 	node.SNI = query.Get("sni")
+	if node.SNI == "" && node.TLS && node.Security != "reality" {
+		node.SNI = node.Host
+		if node.SNI == "" {
+			node.SNI = node.Server
+		}
+	}
+
+	// Fingerprint（TLS/Reality 指纹）
+	node.Fingerprint = query.Get("fp")
+	if node.Fingerprint == "" {
+		node.Fingerprint = query.Get("fingerprint")
+	}
+
+	// Reality 相关参数
+	if node.Security == "reality" {
+		node.PublicKey = query.Get("pbk")
+		node.ShortId = query.Get("sid")
+		node.SpiderX = query.Get("spx")
+		// Reality 必须有 SNI
+		if node.SNI == "" {
+			node.SNI = query.Get("serverName")
+		}
+	}
+
+	// ALPN
+	node.ALPN = query.Get("alpn")
+
+	// Header 类型（kcp/quic 等）
+	node.Type = query.Get("headerType")
+
+	// GRPC 服务名
+	if serviceName := query.Get("serviceName"); serviceName != "" && node.Network == "grpc" {
+		node.Path = serviceName
+	}
+
+	// xhttp/splithttp/httpupgrade 的额外参数
+	if node.Network == "xhttp" || node.Network == "splithttp" || node.Network == "httpupgrade" {
+		if node.Path == "" {
+			node.Path = "/"
+		}
+	}
 
 	if node.Server == "" || node.Port == 0 || node.UUID == "" {
 		return nil
@@ -440,8 +608,11 @@ func parseVless(link string) *ProxyNode {
 
 // parseSS 解析 ss 链接
 func parseSS(link string) *ProxyNode {
-	// ss://base64(method:password)@host:port#name
-	// 或 ss://base64(method:password@host:port)#name
+	// 支持多种格式:
+	// ss://base64(method:password)@host:port#name (SIP002)
+	// ss://base64(method:password@host:port)#name (旧格式)
+	// ss://method:password@host:port#name (明文格式)
+	origLink := link
 	link = strings.TrimPrefix(link, "ss://")
 
 	var name string
@@ -456,57 +627,70 @@ func parseSS(link string) *ProxyNode {
 		Name:     name,
 	}
 
+	// 尝试解析 SIP002 格式: base64(method:password)@host:port
 	if atIdx := strings.LastIndex(link, "@"); atIdx != -1 {
-		// 新格式
 		userInfo := link[:atIdx]
 		hostPort := link[atIdx+1:]
 
-		decoded, err := base64.URLEncoding.DecodeString(userInfo)
-		if err != nil {
-			decoded, _ = base64.StdEncoding.DecodeString(userInfo)
-		}
-		if decoded != nil {
+		// 尝试 base64 解码 userInfo
+		if decoded := tryBase64Decode(userInfo); decoded != nil {
 			parts := strings.SplitN(string(decoded), ":", 2)
+			if len(parts) == 2 {
+				node.Method = parts[0]
+				node.Password = parts[1]
+			}
+		} else {
+			// 可能是明文格式 method:password
+			parts := strings.SplitN(userInfo, ":", 2)
 			if len(parts) == 2 {
 				node.Method = parts[0]
 				node.Password = parts[1]
 			}
 		}
 
-		parts := strings.Split(hostPort, ":")
-		if len(parts) == 2 {
-			node.Server = parts[0]
-			node.Port, _ = strconv.Atoi(parts[1])
+		// 解析 host:port（可能包含 IPv6）
+		if strings.HasPrefix(hostPort, "[") {
+			// IPv6: [::1]:port
+			if endBracket := strings.Index(hostPort, "]:"); endBracket != -1 {
+				node.Server = hostPort[1:endBracket]
+				node.Port, _ = strconv.Atoi(hostPort[endBracket+2:])
+			}
+		} else {
+			parts := strings.Split(hostPort, ":")
+			if len(parts) >= 2 {
+				node.Server = parts[0]
+				node.Port, _ = strconv.Atoi(parts[len(parts)-1])
+			}
 		}
 	} else {
-		// 旧格式
-		decoded, err := base64.URLEncoding.DecodeString(link)
-		if err != nil {
-			decoded, _ = base64.StdEncoding.DecodeString(link)
+		// 旧格式: 整个内容是 base64 编码
+		decoded := tryBase64Decode(link)
+		if decoded == nil {
+			return nil
 		}
-		if decoded != nil {
-			// method:password@host:port
-			if atIdx := strings.LastIndex(string(decoded), "@"); atIdx != -1 {
-				userInfo := string(decoded)[:atIdx]
-				hostPort := string(decoded)[atIdx+1:]
+		// method:password@host:port
+		decodedStr := string(decoded)
+		if atIdx := strings.LastIndex(decodedStr, "@"); atIdx != -1 {
+			userInfo := decodedStr[:atIdx]
+			hostPort := decodedStr[atIdx+1:]
 
-				parts := strings.SplitN(userInfo, ":", 2)
-				if len(parts) == 2 {
-					node.Method = parts[0]
-					node.Password = parts[1]
-				}
+			parts := strings.SplitN(userInfo, ":", 2)
+			if len(parts) == 2 {
+				node.Method = parts[0]
+				node.Password = parts[1]
+			}
 
-				hpParts := strings.Split(hostPort, ":")
-				if len(hpParts) == 2 {
-					node.Server = hpParts[0]
-					node.Port, _ = strconv.Atoi(hpParts[1])
-				}
+			hpParts := strings.Split(hostPort, ":")
+			if len(hpParts) >= 2 {
+				node.Server = hpParts[0]
+				node.Port, _ = strconv.Atoi(hpParts[len(hpParts)-1])
 			}
 		}
 	}
 
-	node.Raw = "ss://" + link
-	if node.Server == "" || node.Port == 0 {
+	node.Raw = origLink
+	// 验证必要字段
+	if node.Server == "" || node.Port == 0 || node.Method == "" {
 		return nil
 	}
 	return node
@@ -521,20 +705,141 @@ func parseTrojan(link string) *ProxyNode {
 	}
 
 	port, _ := strconv.Atoi(u.Port())
+	name, _ := url.QueryUnescape(u.Fragment)
 	node := &ProxyNode{
 		Raw:      link,
 		Protocol: "trojan",
 		Password: u.User.Username(),
 		Server:   u.Hostname(),
 		Port:     port,
-		Name:     u.Fragment,
+		Name:     name,
 		TLS:      true, // trojan 默认 TLS
 	}
 
 	query := u.Query()
 	node.SNI = query.Get("sni")
+	if node.SNI == "" {
+		node.SNI = node.Server
+	}
 	if host := query.Get("host"); host != "" {
 		node.Host = host
+	}
+
+	// 传输协议
+	node.Network = query.Get("type")
+	if node.Network == "" {
+		node.Network = "tcp"
+	}
+
+	// 路径
+	if path := query.Get("path"); path != "" {
+		node.Path, _ = url.QueryUnescape(path)
+	}
+
+	// Fingerprint
+	node.Fingerprint = query.Get("fp")
+
+	// ALPN
+	node.ALPN = query.Get("alpn")
+
+	if node.Server == "" || node.Port == 0 || node.Password == "" {
+		return nil
+	}
+	return node
+}
+
+// parseHysteria2 解析 hysteria2/hy2 链接
+func parseHysteria2(link string) *ProxyNode {
+	// hysteria2://password@server:port?params#name
+	// hy2://password@server:port?params#name
+	link = strings.Replace(link, "hy2://", "hysteria2://", 1)
+	u, err := url.Parse(link)
+	if err != nil {
+		return nil
+	}
+
+	port, _ := strconv.Atoi(u.Port())
+	name, _ := url.QueryUnescape(u.Fragment)
+
+	node := &ProxyNode{
+		Raw:      link,
+		Protocol: "hysteria2",
+		Password: u.User.Username(),
+		Server:   u.Hostname(),
+		Port:     port,
+		Name:     name,
+		TLS:      true, // hysteria2 默认 TLS
+	}
+
+	query := u.Query()
+	node.SNI = query.Get("sni")
+	if node.SNI == "" {
+		node.SNI = node.Server
+	}
+
+	// ALPN
+	node.ALPN = query.Get("alpn")
+	if node.ALPN == "" {
+		node.ALPN = "h3"
+	}
+
+	// Fingerprint
+	node.Fingerprint = query.Get("pinSHA256")
+
+	// obfs
+	if obfs := query.Get("obfs"); obfs != "" {
+		node.Type = obfs
+		node.Path = query.Get("obfs-password")
+	}
+
+	if node.Server == "" || node.Port == 0 || node.Password == "" {
+		return nil
+	}
+	return node
+}
+
+// parseAnyTLS 解析 anytls 链接
+func parseAnyTLS(link string) *ProxyNode {
+	// anytls://password@server:port?params#name
+	u, err := url.Parse(link)
+	if err != nil {
+		return nil
+	}
+
+	port, _ := strconv.Atoi(u.Port())
+	name, _ := url.QueryUnescape(u.Fragment)
+
+	node := &ProxyNode{
+		Raw:      link,
+		Protocol: "anytls",
+		Password: u.User.Username(),
+		Server:   u.Hostname(),
+		Port:     port,
+		Name:     name,
+		TLS:      true,
+	}
+
+	query := u.Query()
+	node.SNI = query.Get("sni")
+	if node.SNI == "" {
+		node.SNI = query.Get("serverName")
+	}
+	if node.SNI == "" {
+		node.SNI = node.Server
+	}
+
+	// Fingerprint
+	node.Fingerprint = query.Get("fp")
+	if node.Fingerprint == "" {
+		node.Fingerprint = query.Get("fingerprint")
+	}
+
+	// ALPN
+	node.ALPN = query.Get("alpn")
+
+	// insecure
+	if query.Get("allowInsecure") == "1" || query.Get("insecure") == "1" {
+		// 标记跳过证书验证
 	}
 
 	if node.Server == "" || node.Port == 0 || node.Password == "" {
@@ -571,6 +876,11 @@ func parseDirectProxy(link string) *ProxyNode {
 
 // startInstanceLocked 内部方法：启动实例（需要持有锁）
 func (pm *ProxyManager) startInstanceLocked(node *ProxyNode) (*XrayInstance, error) {
+	// xray-core 不支持的协议，直接跳过
+	if node.Protocol == "hysteria2" || node.Protocol == "hy2" || node.Protocol == "anytls" {
+		return nil, fmt.Errorf("协议 %s 不被 xray-core 支持", node.Protocol)
+	}
+
 	// 直接代理不需要 xray
 	if node.Protocol == "http" || node.Protocol == "https" || node.Protocol == "socks5" {
 		return &XrayInstance{
@@ -661,14 +971,11 @@ func (pm *ProxyManager) buildXrayConfig(node *ProxyNode, localPort int) *core.Co
 	}
 	return config
 }
-
-// allocatePort 分配端口（增强版：多次尝试+端口验证）
 func (pm *ProxyManager) allocatePort() int {
 	for port := pm.basePort; port < pm.basePort+1000; port++ {
 		if _, exists := pm.instances[port]; exists {
 			continue
 		}
-		// 检查端口是否真正可用（双重验证）
 		if pm.isPortAvailable(port) {
 			return port
 		}
@@ -684,11 +991,8 @@ func (pm *ProxyManager) isPortAvailable(port int) bool {
 		return false
 	}
 	ln.Close()
-
-	// 短暂等待端口释放
 	time.Sleep(10 * time.Millisecond)
 
-	// 再次验证
 	ln2, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		return false
@@ -723,6 +1027,16 @@ func (pm *ProxyManager) generateXrayConfig(node *ProxyNode, localPort int) strin
 		}`, node.Server, node.Port, node.UUID, node.AlterId, node.Security, pm.generateStreamSettings(node), muxConfig)
 
 	case "vless":
+		// VLESS 支持 flow（XTLS）
+		flowStr := ""
+		if node.Flow != "" {
+			flowStr = fmt.Sprintf(`,"flow": "%s"`, node.Flow)
+		}
+		// 如果使用 flow，禁用 mux
+		muxStr := muxConfig
+		if node.Flow != "" {
+			muxStr = `"mux": {"enabled": false}`
+		}
 		outbound = fmt.Sprintf(`{
 			"protocol": "vless",
 			"settings": {
@@ -731,13 +1045,13 @@ func (pm *ProxyManager) generateXrayConfig(node *ProxyNode, localPort int) strin
 					"port": %d,
 					"users": [{
 						"id": "%s",
-						"encryption": "none"
+						"encryption": "none"%s
 					}]
 				}]
 			},
 			"streamSettings": %s,
 			%s
-		}`, node.Server, node.Port, node.UUID, pm.generateStreamSettings(node), muxConfig)
+		}`, node.Server, node.Port, node.UUID, flowStr, pm.generateStreamSettings(node), muxStr)
 
 	case "shadowsocks":
 		outbound = fmt.Sprintf(`{
@@ -766,23 +1080,13 @@ func (pm *ProxyManager) generateXrayConfig(node *ProxyNode, localPort int) strin
 			"streamSettings": %s,
 			%s
 		}`, node.Server, node.Port, node.Password, pm.generateStreamSettings(node), muxConfig)
-
-	case "hysteria2", "hy2":
-		// Hysteria2 使用 QUIC 传输
-		outbound = fmt.Sprintf(`{
-			"protocol": "hysteria2",
-			"settings": {
-				"servers": [{
-					"address": "%s:%d",
-					"password": "%s"
-				}]
-			}
-		}`, node.Server, node.Port, node.Password)
 	}
-
 	return fmt.Sprintf(`{
 		"log": {
-			"loglevel": "none"
+			"access": "none",
+			"error": "none",
+			"loglevel": "none",
+			"dnsLog": false
 		},
 		"inbounds": [{
 			"port": %d,
@@ -806,54 +1110,125 @@ func (pm *ProxyManager) generateStreamSettings(node *ProxyNode) string {
 	var settings string
 	switch network {
 	case "ws":
-		settings = fmt.Sprintf(`"wsSettings": {"path": "%s", "headers": {"Host": "%s"}}`, node.Path, node.Host)
+		host := node.Host
+		if host == "" {
+			host = node.Server
+		}
+		settings = fmt.Sprintf(`"wsSettings": {"path": "%s", "headers": {"Host": "%s"}}`, node.Path, host)
+
 	case "grpc":
-		settings = fmt.Sprintf(`"grpcSettings": {"serviceName": "%s"}`, node.Path)
+		settings = fmt.Sprintf(`"grpcSettings": {"serviceName": "%s", "multiMode": true}`, node.Path)
+
 	case "kcp", "mkcp":
-		// mKCP 传输配置
 		headerType := "none"
 		if node.Type != "" {
 			headerType = node.Type
 		}
 		settings = fmt.Sprintf(`"kcpSettings": {
-			"mtu": 1350,
-			"tti": 50,
-			"uplinkCapacity": 12,
-			"downlinkCapacity": 100,
-			"congestion": false,
-			"readBufferSize": 2,
-			"writeBufferSize": 2,
+			"mtu": 1350, "tti": 50, "uplinkCapacity": 12, "downlinkCapacity": 100,
+			"congestion": false, "readBufferSize": 2, "writeBufferSize": 2,
 			"header": {"type": "%s"}
 		}`, headerType)
+
 	case "quic":
 		headerType := "none"
 		if node.Type != "" {
 			headerType = node.Type
 		}
-		settings = fmt.Sprintf(`"quicSettings": {
-			"security": "none",
-			"key": "",
-			"header": {"type": "%s"}
-		}`, headerType)
+		settings = fmt.Sprintf(`"quicSettings": {"security": "none", "key": "", "header": {"type": "%s"}}`, headerType)
+
+	case "httpupgrade":
+		host := node.Host
+		if host == "" {
+			host = node.Server
+		}
+		path := node.Path
+		if path == "" {
+			path = "/"
+		}
+		settings = fmt.Sprintf(`"httpupgradeSettings": {"path": "%s", "host": "%s"}`, path, host)
+
+	case "splithttp", "xhttp":
+		host := node.Host
+		if host == "" {
+			host = node.Server
+		}
+		path := node.Path
+		if path == "" {
+			path = "/"
+		}
+		settings = fmt.Sprintf(`"splithttpSettings": {"path": "%s", "host": "%s"}`, path, host)
+
+	case "h2", "http":
+		host := node.Host
+		if host == "" {
+			host = node.Server
+		}
+		path := node.Path
+		if path == "" {
+			path = "/"
+		}
+		settings = fmt.Sprintf(`"httpSettings": {"path": "%s", "host": ["%s"]}`, path, host)
+
 	default:
 		settings = ""
 	}
 
+	// 安全设置
 	security := "none"
-	tlsSettings := ""
-	if node.TLS {
+	securitySettings := ""
+
+	if node.Security == "reality" {
+		// Reality 配置
+		security = "reality"
+		fp := node.Fingerprint
+		if fp == "" {
+			fp = "chrome"
+		}
+		sni := node.SNI
+		if sni == "" {
+			sni = node.Server
+		}
+		securitySettings = fmt.Sprintf(`, "realitySettings": {
+			"serverName": "%s",
+			"fingerprint": "%s",
+			"publicKey": "%s",
+			"shortId": "%s",
+			"spiderX": "%s"
+		}`, sni, fp, node.PublicKey, node.ShortId, node.SpiderX)
+	} else if node.TLS {
+		// TLS 配置
 		security = "tls"
 		sni := node.SNI
 		if sni == "" {
 			sni = node.Server
 		}
-		tlsSettings = fmt.Sprintf(`, "tlsSettings": {"serverName": "%s", "allowInsecure": true}`, sni)
+		fp := node.Fingerprint
+		alpn := node.ALPN
+
+		tlsConfig := fmt.Sprintf(`"serverName": "%s", "allowInsecure": true`, sni)
+		if fp != "" {
+			tlsConfig += fmt.Sprintf(`, "fingerprint": "%s"`, fp)
+		}
+		if alpn != "" {
+			// 解析 ALPN（可能是逗号分隔）
+			alpnList := strings.Split(alpn, ",")
+			alpnJSON := ""
+			for i, a := range alpnList {
+				if i > 0 {
+					alpnJSON += ","
+				}
+				alpnJSON += fmt.Sprintf(`"%s"`, strings.TrimSpace(a))
+			}
+			tlsConfig += fmt.Sprintf(`, "alpn": [%s]`, alpnJSON)
+		}
+		securitySettings = fmt.Sprintf(`, "tlsSettings": {%s}`, tlsConfig)
 	}
 
 	if settings != "" {
-		return fmt.Sprintf(`{"network": "%s", "security": "%s", %s%s}`, network, security, settings, tlsSettings)
+		return fmt.Sprintf(`{"network": "%s", "security": "%s", %s%s}`, network, security, settings, securitySettings)
 	}
-	return fmt.Sprintf(`{"network": "%s", "security": "%s"%s}`, network, security, tlsSettings)
+	return fmt.Sprintf(`{"network": "%s", "security": "%s"%s}`, network, security, securitySettings)
 }
 
 // StopXray 停止 xray 实例
@@ -925,13 +1300,30 @@ func (pm *ProxyManager) CheckHealth(node *ProxyNode) bool {
 }
 
 func (pm *ProxyManager) CheckAllHealth() {
+	// 防止重复执行
 	pm.mu.Lock()
+	if pm.healthChecking {
+		pm.mu.Unlock()
+		return
+	}
 	pm.healthChecking = true
+	hasSubscribes := len(pm.subscribeURLs) > 0
+	pm.mu.Unlock()
+	if hasSubscribes {
+		if err := pm.LoadAll(); err != nil {
+			log.Printf("⚠️ 刷新订阅失败: %v", err)
+		}
+	}
+
+	pm.mu.Lock()
 	nodes := make([]*ProxyNode, len(pm.nodes))
 	copy(nodes, pm.nodes)
 	pm.mu.Unlock()
 
 	if len(nodes) == 0 {
+		pm.mu.Lock()
+		pm.healthChecking = false
+		pm.mu.Unlock()
 		pm.SetReady(true)
 		return
 	}
@@ -960,6 +1352,13 @@ func (pm *ProxyManager) CheckAllHealth() {
 			mu.Lock()
 			if n.Healthy {
 				healthy = append(healthy, n)
+				pm.mu.Lock()
+				pm.healthyNodes = append(pm.healthyNodes, n)
+				if !pm.ready && len(pm.healthyNodes) > 0 {
+					pm.ready = true
+					pm.readyCond.Broadcast()
+				}
+				pm.mu.Unlock()
 			}
 			healthyCount := len(healthy)
 			mu.Unlock()
@@ -1163,4 +1562,277 @@ func (pm *ProxyManager) SetProxies(proxies []string) {
 	pm.healthyNodes = nodes // 假设都健康
 	pm.mu.Unlock()
 	log.Printf("✅ 代理池已设置 %d 个代理", len(nodes))
+}
+
+const (
+	autoRegisterURL      = "https://jgpyjc.top/api/v1/passport/auth/register"
+	autoSubscribeBaseURL = "https://bb1.jgpyjc.top/api/v1/client/subscribe?token="
+	autoRegisterInterval = 1 * time.Hour
+)
+
+// AutoSubscriber 自动订阅管理器
+type AutoSubscriber struct {
+	mu              sync.RWMutex
+	currentToken    string
+	subscribeURL    string
+	lastRefresh     time.Time
+	running         bool
+	stopChan        chan struct{}
+	proxyManager    *ProxyManager
+	refreshInterval time.Duration
+}
+
+var autoSubscriber = &AutoSubscriber{
+	refreshInterval: autoRegisterInterval,
+	stopChan:        make(chan struct{}),
+}
+
+// randString 生成随机字符串
+func randString(n int) string {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	out := make([]byte, n)
+	for i := 0; i < n; i++ {
+		r, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
+		out[i] = letters[r.Int64()]
+	}
+	return string(out)
+}
+
+// ungzipIfNeeded 解压 gzip 数据
+func ungzipIfNeeded(data []byte, header http.Header) ([]byte, error) {
+	ce := strings.ToLower(header.Get("Content-Encoding"))
+	if ce == "gzip" || (len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b) {
+		r, err := gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return nil, err
+		}
+		defer r.Close()
+		return io.ReadAll(r)
+	}
+	return data, nil
+}
+
+// extractToken 从响应中提取 token
+func extractToken(body []byte) string {
+	var j interface{}
+	if err := json.Unmarshal(body, &j); err != nil {
+		return ""
+	}
+
+	var walk func(interface{}) string
+	walk = func(x interface{}) string {
+		switch v := x.(type) {
+		case map[string]interface{}:
+			for _, key := range []string{"token", "access_token", "data", "result", "auth", "jwt"} {
+				if val, ok := v[key]; ok {
+					if s, ok2 := val.(string); ok2 && s != "" {
+						return s
+					}
+					if res := walk(val); res != "" {
+						return res
+					}
+				}
+			}
+			// 检查 JWT 格式
+			for _, val := range v {
+				if s, ok := val.(string); ok && looksLikeJWT(s) {
+					return s
+				}
+			}
+		case []interface{}:
+			for _, item := range v {
+				if res := walk(item); res != "" {
+					return res
+				}
+			}
+		}
+		return ""
+	}
+	return walk(j)
+}
+
+// looksLikeJWT 判断是否像 JWT
+func looksLikeJWT(s string) bool {
+	parts := strings.Count(s, ".")
+	return parts >= 2 && len(s) > 30
+}
+
+// 常见邮箱域名
+var emailDomains = []string{
+	"gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "icloud.com",
+	"protonmail.com", "mail.com", "zoho.com", "aol.com", "yandex.com",
+	"163.com", "qq.com", "126.com", "sina.com", "foxmail.com",
+}
+
+// doAutoRegister 执行一次自动注册
+func doAutoRegister() (email, password, token string, err error) {
+	// 随机邮箱：随机用户名 + 随机域名
+	domainIdx, _ := rand.Int(rand.Reader, big.NewInt(int64(len(emailDomains))))
+	email = randString(8+int(domainIdx.Int64()%5)) + "@" + emailDomains[domainIdx.Int64()]
+	password = randString(20)
+
+	form := url.Values{}
+	form.Set("email", email)
+	form.Set("password", password)
+	form.Set("invite_code", "odtRDsfd")
+	form.Set("email_code", "")
+
+	req, err := http.NewRequest("POST", autoRegisterURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", "", "", err
+	}
+
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10)")
+	req.Header.Set("Accept-Encoding", "gzip")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "https://jgpyjc.top")
+	req.Header.Set("Referer", "https://jgpyjc.top/")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return email, password, "", err
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return email, password, "", err
+	}
+
+	body, err := ungzipIfNeeded(raw, resp.Header)
+	if err != nil {
+		body = raw
+	}
+
+	token = extractToken(body)
+	if token == "" {
+		s := strings.TrimSpace(string(body))
+		if looksLikeJWT(s) {
+			token = s
+		}
+	}
+
+	if token == "" {
+		return email, password, "", fmt.Errorf("未能从响应中提取 token: %s", string(body[:min(200, len(body))]))
+	}
+	return email, password, token, nil
+}
+
+// refreshSubscription 刷新订阅
+func (as *AutoSubscriber) refreshSubscription() error {
+
+	_, _, token, err := doAutoRegister()
+	if err != nil {
+		return fmt.Errorf("注册失败: %w", err)
+	}
+
+	subscribeURL := autoSubscribeBaseURL + token
+
+	as.mu.Lock()
+	as.currentToken = token
+	as.subscribeURL = subscribeURL
+	as.lastRefresh = time.Now()
+	as.mu.Unlock()
+	// 加载订阅到代理池
+	if as.proxyManager != nil {
+		if err := as.loadToProxyManager(); err != nil {
+		}
+	}
+
+	return nil
+}
+
+func (as *AutoSubscriber) loadToProxyManager() error {
+	as.mu.RLock()
+	subURL := as.subscribeURL
+	as.mu.RUnlock()
+
+	if subURL == "" {
+		return fmt.Errorf("订阅URL为空")
+	}
+
+	nodes, err := as.proxyManager.loadFromURL(subURL)
+	if err != nil {
+		return err
+	}
+
+	if len(nodes) == 0 {
+		return fmt.Errorf("订阅中没有可用节点")
+	}
+
+	as.proxyManager.mu.Lock()
+	as.proxyManager.nodes = append(as.proxyManager.nodes, nodes...)
+	as.proxyManager.mu.Unlock()
+	go as.proxyManager.CheckAllHealth()
+
+	return nil
+}
+func (as *AutoSubscriber) Start(pm *ProxyManager) {
+	as.mu.Lock()
+	if as.running {
+		as.mu.Unlock()
+		return
+	}
+	as.running = true
+	as.proxyManager = pm
+	as.stopChan = make(chan struct{})
+	as.mu.Unlock()
+	go func() {
+		if err := as.refreshSubscription(); err != nil {
+		}
+
+		ticker := time.NewTicker(as.refreshInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-as.stopChan:
+				return
+			case <-ticker.C:
+				if err := as.refreshSubscription(); err != nil {
+					log.Printf("❌ [自动订阅] 刷新失败: %v", err)
+				}
+			}
+		}
+	}()
+}
+
+func (as *AutoSubscriber) Stop() {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+
+	if as.running {
+		close(as.stopChan)
+		as.running = false
+	}
+}
+
+func (as *AutoSubscriber) GetCurrentSubscribeURL() string {
+	as.mu.RLock()
+	defer as.mu.RUnlock()
+	return as.subscribeURL
+}
+
+func (as *AutoSubscriber) GetCurrentToken() string {
+	as.mu.RLock()
+	defer as.mu.RUnlock()
+	return as.currentToken
+}
+func (as *AutoSubscriber) IsExpired() bool {
+	as.mu.RLock()
+	defer as.mu.RUnlock()
+	return time.Since(as.lastRefresh) > 2*time.Hour
+}
+func (pm *ProxyManager) StartAutoSubscribe() {
+	autoSubscriber.Start(pm)
+}
+func (pm *ProxyManager) StopAutoSubscribe() {
+	autoSubscriber.Stop()
+}
+func (pm *ProxyManager) GetAutoSubscribeURL() string {
+	return autoSubscriber.GetCurrentSubscribeURL()
+}
+func (pm *ProxyManager) HasAutoSubscribe() bool {
+	return autoSubscriber.GetCurrentToken() != ""
 }
