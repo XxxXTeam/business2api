@@ -54,10 +54,10 @@
 ---
 
 
-> 公益 Demo（免费调用）  
-~~> 🔗 链接：<https://business2api.openel.top>~~
-> 受到谷歌上游影响，持续导致请求失败，暂时对api进行暂停，GLM Api不受到影响
-~~> API Key 获取请访问 https://business2api.openel.top/auth 获取个人专属免费APIKEY~~
+>> 公益 Demo（免费调用）  
+> 🔗 链接：<https://business2api.openel.top>
+>
+> > API Key 获取请访问 https://business2api.openel.top/auth 获取个人专属免费APIKEY
 
 
 >> GLM 公益测试 API
