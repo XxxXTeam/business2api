@@ -62,6 +62,10 @@
 > 🔗 链接：<https://business2api.openel.top>
 >
 > 在线绘图预设测试 [https://chat.openel.top](https://chat.openel.top/)
+
+<img width="1880" height="919" alt="image" src="https://github.com/user-attachments/assets/d05d4b06-2c2a-468f-b8fb-fb6dad8dc3ab" />
+
+
 >
 > > API Key 获取请访问 https://business2api.openel.top/auth 获取个人专属免费APIKEY
 
