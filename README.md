@@ -61,6 +61,8 @@
 >> 公益 Demo（免费调用）  
 > 🔗 链接：<https://business2api.openel.top>
 >
+> 在线绘图预设测试 [https://chat.openel.top](https://chat.openel.top/)
+>
 > > API Key 获取请访问 https://business2api.openel.top/auth 获取个人专属免费APIKEY
 
 
